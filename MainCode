@@ -1,0 +1,550 @@
+#Imports de base
+import os, math, warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import GroupShuffleSplit, train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, RocCurveDisplay
+
+warnings.filterwarnings("ignore")
+plt.rcParams["figure.figsize"] = (10,6)
+
+# Dossier du notebook (mettre "." si le notebook est dans le même dossier que les CSV)
+BASE = Path(".")
+
+# Lister les CSV disponibles dans le dossier (⚠️ on liste un dossier, pas un fichier)
+csv_files = sorted(p.name for p in BASE.glob("*.csv"))
+csv_files
+['IMU_10Hz.csv',
+ 'IMU_20Hz_freq_drop.csv',
+ 'IMU_20Hz_freq_drop_2.csv',
+ 'IMU_2Hz.csv',
+ 'IMU_Acc_Gyro_20Hz.csv',
+ 'IMU_earthquake.csv',
+ 'IMU_extra_weigth.csv',
+ 'IMU_hitting_arm.csv',
+ 'IMU_hitting_platform.csv',
+ 'IMU_magnet.csv',
+ 'nicla.csv',
+ 'quaternions_20Hz.csv',
+ 'quaternions_no_idle.csv',
+ 'right_arm.csv']
+I - Analyse descriptive des données
+# Colonnes communes aux IMU (certains fichiers n'ont pas tout)
+COMMON = ['time','accX','accY','accZ','gyroX','gyroY','gyroZ','magX','magY','magZ','name']
+
+def read_common(path, nrows=None):
+    """Charge un CSV et ne garde que les colonnes IMU connues + source."""
+    df = pd.read_csv(path, nrows=nrows)
+    keep = [c for c in COMMON if c in df.columns]
+    df = df[keep].copy()
+    for c in df.columns:
+        if c not in ('time','name'):
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+    df['source'] = Path(path).name
+    return df
+
+def add_norms(df):
+    """Ajoute des normes acc/gyro/mag si possible."""
+    for name, cols in {
+        'acc_norm':  ['accX','accY','accZ'],
+        'gyro_norm': ['gyroX','gyroY','gyroZ'],
+        'mag_norm':  ['magX','magY','magZ'],
+    }.items():
+        have = [c for c in cols if c in df.columns]
+        if len(have)==3:
+            df[name] = np.sqrt((df[have]**2).sum(axis=1))
+    return df
+
+# Échantillon léger pour EDA
+eda_frames = []
+for f in csv_files:
+    if f.lower().startswith("quaternion"):     # on exclut les quaternions pour l'instant
+        continue
+    try:
+        eda_frames.append(read_common(BASE/f, nrows=5000))
+    except Exception as e:
+        print(f"[WARN] {f}: {e}")
+
+eda = pd.concat(eda_frames, ignore_index=True, sort=False)
+eda = add_norms(eda)
+
+# Taille & colonnes par fichier
+sizes = (eda.groupby('source')['source']
+             .size()
+             .rename('rows')
+             .to_frame())
+sizes['cols_present'] = eda.groupby('source').apply(lambda g: list(g.columns))
+sizes
+
+# Distributions (acc_norm / gyro_norm / mag_norm) par fichier
+for col in ['acc_norm','gyro_norm','mag_norm']:
+    if col in eda:
+        plt.figure()
+        for s, g in eda.groupby('source'):
+            g[col].dropna().sample(min(2000, len(g)), random_state=0).plot(kind='hist', bins=60, alpha=0.35, label=s)
+        plt.title(f"Distribution de {col}")
+        plt.xlabel(col); plt.ylabel("comptes"); plt.legend()
+        plt.show()
+
+# Estimation robuste de la fréquence d'échantillonnage par fichier
+def estimate_hz(df):
+    if 'time' not in df:
+        return np.nan
+    # 1) Essai float (timestamps en secondes)
+    ts = pd.to_numeric(df['time'], errors='coerce')
+    if ts.notna().sum() >= 3:
+        d = np.diff(ts.dropna().values)
+        d = d[d>0]
+        if len(d): 
+            med = np.median(d)
+            return round(1.0/med, 3) if med>0 else np.nan
+    # 2) Essai datetime
+    t = pd.to_datetime(df['time'], errors='coerce', utc=True, infer_datetime_format=True)
+    if t.notna().sum() >= 3:
+        d = np.diff(t.dropna().astype('int64').values/1e9)
+        d = d[d>0]
+        if len(d):
+            med = np.median(d)
+            return round(1.0/med, 3) if med>0 else np.nan
+    return np.nan
+
+hz = eda.groupby('source').apply(estimate_hz).rename('Hz').reset_index()
+hz
+
+
+#II - Pré-traitement
+# Labellisation à partir du nom de fichier
+ANOMYMS = ['earthquake','hitting_arm','hitting_platform','extra_weigth','magnet']
+def label_from_name(name: str) -> int:
+    n = name.lower()
+    return int(any(k in n for k in ANOMYMS))
+
+# Charge tous les fichiers IMU (sauf quaternions pour l'instant) et prépare les features
+all_frames = []
+for f in csv_files:
+    if f.lower().startswith("quaternion"):
+        continue
+    try:
+        df = read_common(BASE/f, nrows=None)   # mettre nrows=200_000 si on veux aller plus vite
+        df['label'] = label_from_name(f)
+        all_frames.append(df)
+    except Exception as e:
+        print(f"[WARN] {f}: {e}")
+
+raw = pd.concat(all_frames, ignore_index=True, sort=False)
+raw = add_norms(raw)
+
+# Colonnes features disponibles
+feature_cols = [c for c in ['accX','accY','accZ','gyroX','gyroY','gyroZ','magX','magY','magZ',
+                            'acc_norm','gyro_norm','mag_norm'] if c in raw.columns]
+raw = raw.dropna(subset=feature_cols, how='all').reset_index(drop=True)
+
+# Normalisation par fichier (évite les biais de calibration capteur)
+scalers = {}
+def scale_by_source(df, cols):
+    parts = []
+    for s, g in df.groupby('source', sort=False):
+        sc = StandardScaler()
+        g = g.copy()
+        g[cols] = sc.fit_transform(g[cols].fillna(method='ffill').fillna(method='bfill').fillna(0.0))
+        scalers[s] = sc
+        parts.append(g)
+    return pd.concat(parts, ignore_index=True)
+
+proc = scale_by_source(raw, feature_cols)
+proc.head()
+
+def window_features(df, cols, win=WIN, overlap=OVERLAP):
+    step = max(1, int(win*(1-overlap)))
+    N = len(df)
+    rows = []
+    for start in range(0, N - win + 1, step):
+        end = start + win
+        sl = df.iloc[start:end]
+        row = {}
+        for c in cols:
+            s = sl[c].values
+            row[f'{c}_mean'] = s.mean()
+            row[f'{c}_std']  = s.std()
+            row[f'{c}_min']  = s.min()
+            row[f'{c}_max']  = s.max()
+            row[f'{c}_rms']  = np.sqrt((s**2).mean())
+        # label majorité dans la fenêtre
+        row['label']  = int(sl['label'].mean() >= 0.5)
+        row['source'] = sl['source'].iloc[0]
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+blocks = []
+for s, g in proc.groupby('source', sort=False):
+    if len(g) >= WIN:
+        blocks.append(window_features(g, feature_cols, win=WIN, overlap=OVERLAP))
+
+dataset = pd.concat(blocks, ignore_index=True, sort=False)
+dataset['label'].value_counts()
+
+#III - Formalisation du problème
+"""
+1) Contexte & but
+Nous disposons de mesures IMU d’un bras UR3e (accélération, gyroscope, magnétomètre) collectées lors de tâches normales (screwdriving, painting, pick-and-place) et lors d’anomalies simulées (earthquake, hitting_arm, hitting_platform, extra_weigth, magnet).
+L’objectif opérationnel est une détection d’anomalies en temps réel compatible TinyML : déclencher une alerte fiable au fil de l’eau, avec peu de calcul et une latence faible.
+
+Formulation ML → classification binaire fenêtre-par-fenêtre :
+
+Entrée : descripteurs statistiques extraits sur des segments temporels glissants des signaux IMU.
+Sortie : y ∈ {0,1} avec 0 = normal, 1 = anomalie.
+2) Unité d’observation (fenêtrage temporel)
+Les fichiers sont échantillonnés à différentes fréquences (2/10/20 Hz). Pour homogénéiser l’analyse, on travaille sur des fenêtres de W échantillons (valeur par défaut W = 50).
+Conséquences temporelles approximatives :
+
+20 Hz → 50 pts ≈ 2,5 s
+10 Hz → 50 pts ≈ 5 s
+2 Hz → 50 pts ≈ 25 s (fenêtre longue, à réduire si besoin pour ce cas)
+Remarque : on peut utiliser un recouvrement (ex. 50 %) pour augmenter la granularité sans augmenter les coûts de labellisation.
+
+Découpage en fenêtres (sans recouvrement pour la baseline) :
+Si un fichier a N lignes, le nombre de fenêtres est ⌊N / W⌋.
+
+3) Variables d’entrée (features)
+À partir des axes (X,Y,Z) on calcule d’abord les normes : [ \text{acc_norm}=\sqrt{accX^2+accY^2+accZ^2},\quad \text{gyro_norm}=\sqrt{gyroX^2+gyroY^2+gyroZ^2},\quad \text{mag_norm}=\sqrt{magX^2+magY^2+magZ^2}. ]
+
+Sur chaque fenêtre, pour chaque signal retenu (axes et/ou normes), on extrait des statistiques robustes :
+
+moyenne, écart-type, min, max, RMS (\left(\sqrt{\frac{1}{W}\sum s^2}\right)).
+Ces features sont peu coûteuses, stables entre capteurs hétérogènes et adaptées à TinyML.
+
+Optionnels (améliorations futures) : énergie de bandes fréquentielles (FFT), dérivées/jerk, corrélations inter-axes, entropie, zcr (zero-crossing rate), etc.
+
+4) Variable cible (labels)
+Pas de colonne label dans les fichiers → on utilise la convention de nommage :
+
+label = 1 si le nom du fichier contient : earthquake, hitting_arm, hitting_platform, extra_weigth, magnet.
+label = 0 sinon (fichiers IMU « normaux » : IMU_2Hz, IMU_10Hz, IMU_Acc_Gyro_20Hz, …).
+Label de fenêtre (majorité simple) :
+si ≥ 50 % des points de la fenêtre sont 1 → fenêtre 1, sinon 0.
+C’est un compromis simple qui stabilise le bruit instantané.
+
+5) Pré-traitements retenus
+Casting numérique robuste (errors='coerce'), suppression des lignes entièrement vides sur les colonnes IMU.
+Standardisation par source (fichier) pour absorber les offsets capteurs : [ z = \frac{x-\mu_{\text{source}}}{\sigma_{\text{source}}} ] Cette normalisation est apprise séparément pour chaque fichier afin d’éviter les fuites d’information.
+Agrégation fenêtre → features statistiques (cf. §3).
+6) Jeu d’évaluation & fuite d’information
+Les échantillons d’une même source (fichier) sont fortement corrélés. On doit donc évaluer par fichier, pas par lignes aléatoires.
+
+Split : GroupShuffleSplit avec group = source (le nom du fichier).
+Test ≈ 30 % des fichiers, Train ≈ 70 %.
+Variante robuste : Leave-One-Group-Out (LOGO) pour tester chaque fichier à tour de rôle (plus coûteux mais plus informatif).
+7) Métriques d’évaluation
+ROC-AUC (global) pour mesurer la capacité de classement.
+PR-AUC / F1 pour tenir compte du déséquilibre (anomalies rares).
+Matrice de confusion (TP/FP/FN/TN) pour fixer des seuils réalistes en exploitation ((P(\text{FP})) acceptable vs rappel ciblé).
+Cible industrielle (exemple) :
+
+Rappel (anomalies) ≥ 95 % ;
+Taux de fausses alertes ≤ 2 % (à ajuster selon le contexte).
+8) Gestion du déséquilibre des classes
+Fenêtrage et majority-label réduisent déjà l’extrême rareté point-par-point.
+Pendant l’entraînement : class_weight='balanced' ou sur-/sous-échantillonnage des fenêtres.
+Évaluation : toujours stratifier par fichier et rapporter PR-AUC.
+9) Modèle baseline (Step 4, annoncé ici)
+RandomForest (200 arbres) sur features statistiques → robuste, peu de réglages, interprétable via l’importance des variables.
+Alternatives TinyML :
+Logistic Regression (faible empreinte mémoire),
+Tiny tree/oblique tree (1–4 nœuds),
+Isolation Forest (non supervisé) si on veut éviter les labels de nommage.
+10) Contraintes temps réel & embarqué
+Latence ≈ taille de fenêtre / fréquence (ex. 50 pts @ 20 Hz → 2,5 s).
+Si la latence doit être < 1 s, deux leviers :
+diminuer W (ex. 20–30) pour les fichiers 10/20 Hz,
+utiliser fenêtres chevauchées (stride plus petit) pour densifier les décisions sans augmenter la latence perçue.
+Coût de calcul : features statistiques (O(W)), modèle léger (LR/mini-tree) pour MCU.
+11) Critères de réussite (baseline)
+Pipeline reproductible (mêmes splits, même normalisation par source).
+ROC-AUC ≥ 0,90 et PR-AUC convenable sur le test par fichier.
+Courbes ROC/PR + matrice de confusion + top features importances.
+Sauvegarde du modèle et des paramètres de normalisation (par source si nécessaire).
+12) Limites & risques
+Labels dérivés du nom de fichier → approximatifs si des segments « mixtes » existent ; la majority-rule l’atténue mais ne l’élimine pas.
+Fréquences hétérogènes → une fenêtre fixe correspond à des durées différentes ; à terme, utiliser une durée (en secondes) plutôt qu’un nombre d’échantillons.
+Covariate shift entre tâches (screwdriving vs painting) : valider par LOGO et, si besoin, ajouter des features spécifiques par tâche (ou un domaine-label si disponible).
+13) Repro (configuration de référence)
+CONFIG = {
+  "window_size": 50,
+  "window_overlap": 0.0,        # 0.5 recommandé si besoin
+  "features": ["mean","std","min","max","rms"],
+  "signals": ["acc_norm","gyro_norm","mag_norm"],
+  "split": {"method":"GroupShuffleSplit", "test_size":0.3, "group":"source", "seed":42},
+  "model": {"type":"RandomForest", "n_estimators":200, "random_state":0, "n_jobs":-1},
+  "metrics": ["classification_report","confusion_matrix","roc_auc","pr_auc"]
+}
+"""
+
+#IV - Modèle baseline + évaluation
+# Sélection des features du modèle
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    roc_auc_score,
+    average_precision_score,
+    RocCurveDisplay,
+    PrecisionRecallDisplay
+)
+
+
+feat_cols_model = [c for c in dataset.columns
+                   if c not in ('label','source')]
+
+X = dataset[feat_cols_model].values
+y = dataset['label'].values
+groups = dataset['source'].values
+
+# Split par fichier
+gss = GroupShuffleSplit(n_splits=1, test_size=0.3, random_state=42)
+train_idx, test_idx = next(gss.split(X, y, groups))
+
+Xtr, Xte = X[train_idx], X[test_idx]
+ytr, yte = y[train_idx], y[test_idx]
+
+# Baseline simple, robuste et rapide
+clf = RandomForestClassifier(n_estimators=200, random_state=0, n_jobs=-1)
+clf.fit(Xtr, ytr)
+
+pred = clf.predict(Xte)
+proba = clf.predict_proba(Xte)[:,1]
+
+print("=== Rapport classification (test) ===")
+print(classification_report(yte, pred, digits=3))
+
+print("=== Matrice de confusion ===")
+print(confusion_matrix(yte, pred))
+
+# ROC-AUC / PR-AUC (protégé si une seule classe en test)
+try:
+    roc = roc_auc_score(yte, proba)
+    pr  = average_precision_score(yte, proba)
+    print(f"ROC-AUC : {roc:.3f}")
+    print(f"PR-AUC  : {pr:.3f}")
+
+    RocCurveDisplay.from_predictions(yte, proba)
+    plt.title("ROC — RandomForest baseline")
+    plt.show()
+
+    PrecisionRecallDisplay.from_predictions(yte, proba)
+    plt.title("Precision–Recall — RandomForest baseline")
+    plt.show()
+except ValueError as e:
+    print("Courbes ROC/PR non calculables :", e)
+
+# (Option) Top features pour interpréter la baseline
+import pandas as pd
+imp = pd.Series(clf.feature_importances_, index=feat_cols_model).sort_values(ascending=False).head(15)
+plt.figure()
+imp.plot(kind="barh")
+plt.gca().invert_yaxis()
+plt.title("Top feature importances — RandomForest")
+plt.xlabel("importance")
+plt.show()
+
+
+#V - Grid Search + Ensembles (LAB 6 appliqué au projet)
+from sklearn.model_selection import GroupShuffleSplit, GridSearchCV
+from sklearn.ensemble import RandomForestClassifier, BaggingClassifier, VotingClassifier
+from sklearn.svm import SVC
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.metrics import (
+    accuracy_score, f1_score, precision_score, recall_score,
+    confusion_matrix, classification_report,
+    roc_auc_score, average_precision_score
+)
+import time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+Train size : (126706, 60)  Test size : (106559, 60)
+Fitting 3 folds for each of 162 candidates, totalling 486 fits
+
+"#1) Reprise des features / labels / groupes
+feat_cols_model = [c for c in dataset.columns
+                   if c not in ("label", "source")]
+
+X = dataset[feat_cols_model].values
+y = dataset["label"].values
+groups = dataset["source"].values
+
+# Split "externe" par fichier : train vs test 
+gss_outer = GroupShuffleSplit(n_splits=1, test_size=0.3, random_state=42)
+train_idx, test_idx = next(gss_outer.split(X, y, groups))
+
+Xtr, Xte = X[train_idx], X[test_idx]
+ytr, yte = y[train_idx], y[test_idx]
+groups_tr = groups[train_idx]
+
+print("Train size :", Xtr.shape, " Test size :", Xte.shape)
+
+#2) GridSearch sur RandomForest (baseline optimisée)
+rf_base = RandomForestClassifier(
+    random_state=0,
+    n_jobs=-1,
+    class_weight="balanced"   # important avec le déséquilibre de classes
+)
+
+rf_param_grid = {
+    "n_estimators": [100, 200, 400],
+    "max_depth": [None, 10, 20],
+    "min_samples_split": [2, 5, 10],
+    "min_samples_leaf": [1, 2, 4],
+    "max_features": ["sqrt", "log2"]
+}
+
+# CV interne par fichier aussi (GroupShuffleSplit)
+cv_inner = GroupShuffleSplit(n_splits=3, test_size=0.2, random_state=42)
+
+rf_grid = GridSearchCV(
+    estimator=rf_base,
+    param_grid=rf_param_grid,
+    cv=cv_inner,
+    scoring="f1",      # meilleur que accuracy sur ce type de problème
+    n_jobs=-1,
+    verbose=2
+)
+
+rf_grid.fit(Xtr, ytr, groups=groups_tr)
+
+print("\n=== RandomForest — meilleurs hyperparamètres (CV interne) ===")
+print(rf_grid.best_params_)
+print(f"Best CV F1-score: {rf_grid.best_score_:.3f}")
+
+best_rf = rf_grid.best_estimator_
+#3) Helper d'évaluation pour tous les modèles
+def eval_model(name, model, Xtr, ytr, Xte, yte):
+    """Fit + prédiction + métriques + temps, pour un modèle donné."""
+    t0 = time.time()
+    model.fit(Xtr, ytr)
+    fit_time = time.time() - t0
+
+    t1 = time.time()
+    y_pred = model.predict(Xte)
+    infer_time = time.time() - t1
+
+    # Probabilités si dispo (sinon None)
+    try:
+        y_proba = model.predict_proba(Xte)[:, 1]
+    except AttributeError:
+        y_proba = None
+
+    acc  = accuracy_score(yte, y_pred)
+    f1   = f1_score(yte, y_pred)
+    prec = precision_score(yte, y_pred)
+    rec  = recall_score(yte, y_pred)
+
+    print(f"\n================ {name} ================")
+    print(classification_report(yte, y_pred, digits=3))
+    print("Confusion matrix:\n", confusion_matrix(yte, y_pred))
+
+    roc = pr = None
+    if y_proba is not None and len(np.unique(yte)) == 2:
+        roc = roc_auc_score(yte, y_proba)
+        pr  = average_precision_score(yte, y_proba)
+        print(f"ROC-AUC: {roc:.3f}")
+        print(f"PR-AUC : {pr:.3f}")
+
+    return {
+        "model": name,
+        "accuracy": acc,
+        "f1": f1,
+        "precision": prec,
+        "recall": rec,
+        "roc_auc": roc,
+        "pr_auc": pr,
+        "fit_time_s": fit_time,
+        "infer_time_s": infer_time
+    }
+
+results = []
+
+# Évaluation de la baseline optimisée RandomForest
+results.append(eval_model("RandomForest (tuned)", best_rf, Xtr, ytr, Xte, yte))
+
+#4) Ensemble 1 : Bagging SVM
+# --- 4.1 Ensemble 1 : Bagging SVM ( ---
+
+svm_base = SVC(
+    probability=True,
+    random_state=42,
+    class_weight="balanced",
+    C=1.0,
+    kernel="rbf",
+    gamma="scale"
+)
+
+bag_svm = BaggingClassifier(
+    estimator=svm_base,
+    n_estimators=5,      # ne pas mettre trop haut pour ne pas tuer le PC
+    max_samples=0.7,
+    n_jobs=-1,
+    random_state=42
+)
+
+results.append(
+    eval_model("Bagging SVM (no tuning)", bag_svm, Xtr, ytr, Xte, yte)
+)
+
+
+# --- 4.2 Ensemble 2 : Bagging Decision Tree ---
+
+tree_base = DecisionTreeClassifier(
+    random_state=42,
+    class_weight="balanced",
+    max_depth=5,
+    min_samples_split=5,
+    min_samples_leaf=2
+)
+
+bag_tree = BaggingClassifier(
+    estimator=tree_base,
+    n_estimators=15,     # ne pas mettre trop haut pour ne pas tuer le PC
+    max_samples=0.7,
+    n_jobs=-1,
+    random_state=42
+)
+
+results.append(
+    eval_model("Bagging Tree (no tuning)", bag_tree, Xtr, ytr, Xte, yte)
+)
+
+
+# --- 4.3 Ensemble 3 : Voting (RF + Bagging SVM + Bagging Tree) ---
+
+voting_clf = VotingClassifier(
+    estimators=[
+        ("rf", best_rf),          
+        ("bag_svm", bag_svm),
+        ("bag_tree", bag_tree)
+    ],
+    voting="soft",
+    n_jobs=-1
+)
+
+results.append(
+    eval_model("Voting (RF + BagSVM + BagTree)", voting_clf, Xtr, ytr, Xte, yte)
+)
+
+
+# --- 4.4 Tableau récap + barplot ---
+
+results_df = pd.DataFrame(results)
+display(results_df.sort_values("f1", ascending=False))
+
+plt.figure(figsize=(8, 4))
+plt.bar(results_df["model"], results_df["accuracy"])
+plt.xticks(rotation=20, ha="right")
+plt.ylabel("Accuracy (test)")
+plt.title("Comparison of models on IMU anomaly detection")
+plt.tight_layout()
+plt.show()

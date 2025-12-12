@@ -1,4 +1,8 @@
-#Imports de base
+# %% [markdown]
+# # Imports de base
+
+# %%
+# --- 0. Imports & config ---
 import os, math, warnings
 from pathlib import Path
 
@@ -20,21 +24,12 @@ BASE = Path(".")
 # Lister les CSV disponibles dans le dossier (⚠️ on liste un dossier, pas un fichier)
 csv_files = sorted(p.name for p in BASE.glob("*.csv"))
 csv_files
-['IMU_10Hz.csv',
- 'IMU_20Hz_freq_drop.csv',
- 'IMU_20Hz_freq_drop_2.csv',
- 'IMU_2Hz.csv',
- 'IMU_Acc_Gyro_20Hz.csv',
- 'IMU_earthquake.csv',
- 'IMU_extra_weigth.csv',
- 'IMU_hitting_arm.csv',
- 'IMU_hitting_platform.csv',
- 'IMU_magnet.csv',
- 'nicla.csv',
- 'quaternions_20Hz.csv',
- 'quaternions_no_idle.csv',
- 'right_arm.csv']
-I - Analyse descriptive des données
+
+
+# %% [markdown]
+#  # I - Analyse descriptive des données
+
+# %%
 # Colonnes communes aux IMU (certains fichiers n'ont pas tout)
 COMMON = ['time','accX','accY','accZ','gyroX','gyroY','gyroZ','magX','magY','magZ','name']
 
@@ -82,6 +77,8 @@ sizes = (eda.groupby('source')['source']
 sizes['cols_present'] = eda.groupby('source').apply(lambda g: list(g.columns))
 sizes
 
+
+# %%
 # Distributions (acc_norm / gyro_norm / mag_norm) par fichier
 for col in ['acc_norm','gyro_norm','mag_norm']:
     if col in eda:
@@ -92,6 +89,8 @@ for col in ['acc_norm','gyro_norm','mag_norm']:
         plt.xlabel(col); plt.ylabel("comptes"); plt.legend()
         plt.show()
 
+
+# %%
 # Estimation robuste de la fréquence d'échantillonnage par fichier
 def estimate_hz(df):
     if 'time' not in df:
@@ -118,7 +117,10 @@ hz = eda.groupby('source').apply(estimate_hz).rename('Hz').reset_index()
 hz
 
 
-#II - Pré-traitement
+# %% [markdown]
+# # II - Pré-traitement
+
+# %%
 # Labellisation à partir du nom de fichier
 ANOMYMS = ['earthquake','hitting_arm','hitting_platform','extra_weigth','magnet']
 def label_from_name(name: str) -> int:
@@ -160,6 +162,12 @@ def scale_by_source(df, cols):
 proc = scale_by_source(raw, feature_cols)
 proc.head()
 
+
+# %%
+# Fenêtrage statistique (features sur fenêtres glissantes)
+WIN = 50          # 50 échantillons
+OVERLAP = 0.5     # 50% de recouvrement
+
 def window_features(df, cols, win=WIN, overlap=OVERLAP):
     step = max(1, int(win*(1-overlap)))
     N = len(df)
@@ -189,103 +197,152 @@ for s, g in proc.groupby('source', sort=False):
 dataset = pd.concat(blocks, ignore_index=True, sort=False)
 dataset['label'].value_counts()
 
-#III - Formalisation du problème
-"""
-1) Contexte & but
-Nous disposons de mesures IMU d’un bras UR3e (accélération, gyroscope, magnétomètre) collectées lors de tâches normales (screwdriving, painting, pick-and-place) et lors d’anomalies simulées (earthquake, hitting_arm, hitting_platform, extra_weigth, magnet).
-L’objectif opérationnel est une détection d’anomalies en temps réel compatible TinyML : déclencher une alerte fiable au fil de l’eau, avec peu de calcul et une latence faible.
 
-Formulation ML → classification binaire fenêtre-par-fenêtre :
+# %% [markdown]
+# # III - Formalisation du problème
+# 
+# ## 1) Contexte & but
+# Nous disposons de mesures **IMU** d’un bras UR3e (accélération, gyroscope, magnétomètre) collectées lors de tâches normales (screwdriving, painting, pick-and-place) et lors d’**anomalies simulées** (earthquake, hitting_arm, hitting_platform, extra_weigth, magnet).  
+# L’objectif opérationnel est une **détection d’anomalies en temps réel** compatible TinyML : déclencher une alerte fiable au fil de l’eau, avec peu de calcul et une latence faible.
+# 
+# **Formulation ML** → *classification binaire fenêtre-par-fenêtre* :  
+# - **Entrée** : descripteurs statistiques extraits sur des segments temporels glissants des signaux IMU.  
+# - **Sortie** : `y ∈ {0,1}` avec `0 = normal`, `1 = anomalie`.
+# 
+# ---
+# 
+# ## 2) Unité d’observation (fenêtrage temporel)
+# Les fichiers sont échantillonnés à différentes fréquences (2/10/20 Hz). Pour homogénéiser l’analyse, on travaille sur des **fenêtres de `W` échantillons** (valeur par défaut `W = 50`).  
+# Conséquences temporelles approximatives :
+# - 20 Hz → 50 pts ≈ **2,5 s**  
+# - 10 Hz → 50 pts ≈ **5 s**  
+# - 2 Hz  → 50 pts ≈ **25 s** (fenêtre longue, à réduire si besoin pour ce cas)
+# 
+# > Remarque : on peut utiliser un **recouvrement** (ex. 50 %) pour augmenter la granularité sans augmenter les coûts de labellisation.
+# 
+# **Découpage en fenêtres** (sans recouvrement pour la baseline) :  
+# Si un fichier a `N` lignes, le nombre de fenêtres est `⌊N / W⌋`.
+# 
+# ---
+# 
+# ## 3) Variables d’entrée (features)
+# À partir des axes `(X,Y,Z)` on calcule d’abord les **normes** :
+# \[
+# \text{acc\_norm}=\sqrt{accX^2+accY^2+accZ^2},\quad
+# \text{gyro\_norm}=\sqrt{gyroX^2+gyroY^2+gyroZ^2},\quad
+# \text{mag\_norm}=\sqrt{magX^2+magY^2+magZ^2}.
+# \]
+# 
+# Sur chaque fenêtre, pour chaque signal retenu (axes et/ou normes), on extrait des **statistiques robustes** :
+# - moyenne, écart-type, min, max, RMS \(\left(\sqrt{\frac{1}{W}\sum s^2}\right)\).
+# 
+# > Ces features sont peu coûteuses, stables entre capteurs hétérogènes et adaptées à TinyML.
+# 
+# **Optionnels (améliorations futures)** : énergie de bandes fréquentielles (FFT), dérivées/jerk, corrélations inter-axes, entropie, zcr (zero-crossing rate), etc.
+# 
+# ---
+# 
+# ## 4) Variable cible (labels)
+# Pas de colonne `label` dans les fichiers → on utilise la **convention de nommage** :
+# - `label = 1` si le nom du fichier contient : `earthquake`, `hitting_arm`, `hitting_platform`, `extra_weigth`, `magnet`.
+# - `label = 0` sinon (fichiers IMU « normaux » : `IMU_2Hz`, `IMU_10Hz`, `IMU_Acc_Gyro_20Hz`, …).
+# 
+# **Label de fenêtre** (majorité simple) :  
+# si ≥ 50 % des points de la fenêtre sont `1` → fenêtre `1`, sinon `0`.  
+# C’est un compromis simple qui stabilise le bruit instantané.
+# 
+# ---
+# 
+# ## 5) Pré-traitements retenus
+# - **Casting** numérique robuste (`errors='coerce'`), suppression des lignes entièrement vides sur les colonnes IMU.
+# - **Standardisation par source** (fichier) pour absorber les offsets capteurs :
+#   \[
+#   z = \frac{x-\mu_{\text{source}}}{\sigma_{\text{source}}}
+#   \]
+#   Cette normalisation est apprise **séparément** pour chaque fichier afin d’éviter les fuites d’information.
+# - **Agrégation fenêtre** → features statistiques (cf. §3).
+# 
+# ---
+# 
+# ## 6) Jeu d’évaluation & fuite d’information
+# Les échantillons d’une même source (fichier) sont **fortement corrélés**. On doit donc évaluer **par fichier**, pas par lignes aléatoires.
+# 
+# - **Split** : `GroupShuffleSplit` avec `group = source` (le nom du fichier).  
+#   Test ≈ 30 % des fichiers, Train ≈ 70 %.  
+# - Variante robuste : **Leave-One-Group-Out** (LOGO) pour tester chaque fichier à tour de rôle (plus coûteux mais plus informatif).
+# 
+# ---
+# 
+# ## 7) Métriques d’évaluation
+# - **ROC-AUC** (global) pour mesurer la capacité de classement.  
+# - **PR-AUC** / **F1** pour tenir compte du **déséquilibre** (anomalies rares).  
+# - **Matrice de confusion** (TP/FP/FN/TN) pour fixer des seuils réalistes en exploitation (\(P(\text{FP})\) acceptable vs rappel ciblé).
+# 
+# **Cible industrielle** (exemple) :  
+# - Rappel (anomalies) ≥ 95 % ;  
+# - Taux de fausses alertes ≤ 2 % (à ajuster selon le contexte).
+# 
+# ---
+# 
+# ## 8) Gestion du déséquilibre des classes
+# - **Fenêtrage** et **majority-label** réduisent déjà l’extrême rareté point-par-point.  
+# - Pendant l’entraînement : `class_weight='balanced'` ou sur-/sous-échantillonnage des fenêtres.  
+# - Évaluation : toujours **stratifier par fichier** et **rapporter PR-AUC**.
+# 
+# ---
+# 
+# ## 9) Modèle baseline (Step 4, annoncé ici)
+# - **RandomForest** (200 arbres) sur features statistiques → robuste, peu de réglages, interprétable via l’importance des variables.  
+# - **Alternatives TinyML** :  
+#   - **Logistic Regression** (faible empreinte mémoire),  
+#   - **Tiny tree/oblique tree** (1–4 nœuds),  
+#   - **Isolation Forest** (non supervisé) si on veut éviter les labels de nommage.
+# 
+# ---
+# 
+# ## 10) Contraintes temps réel & embarqué
+# - **Latence** ≈ taille de fenêtre / fréquence (ex. 50 pts @ 20 Hz → 2,5 s).  
+# - Si la latence doit être < 1 s, deux leviers :  
+#   1) diminuer `W` (ex. 20–30) pour les fichiers 10/20 Hz,  
+#   2) utiliser **fenêtres chevauchées** (stride plus petit) pour densifier les décisions sans augmenter la latence perçue.
+# - **Coût de calcul** : features statistiques \(O(W)\), modèle léger (LR/mini-tree) pour MCU.
+# 
+# ---
+# 
+# ## 11) Critères de réussite (baseline)
+# - Pipeline **reproductible** (mêmes splits, même normalisation par source).  
+# - ROC-AUC ≥ 0,90 et PR-AUC convenable sur le test par fichier.  
+# - Courbes ROC/PR + matrice de confusion + top features importances.  
+# - Sauvegarde du modèle et des paramètres de normalisation (par source si nécessaire).
+# 
+# ---
+# 
+# ## 12) Limites & risques
+# - **Labels dérivés du nom de fichier** → approximatifs si des segments « mixtes » existent ; la majority-rule l’atténue mais ne l’élimine pas.  
+# - **Fréquences hétérogènes** → une fenêtre fixe correspond à des durées différentes ; à terme, utiliser une *durée* (en secondes) plutôt qu’un nombre d’échantillons.  
+# - **Covariate shift** entre tâches (screwdriving vs painting) : valider par **LOGO** et, si besoin, ajouter des features spécifiques par tâche (ou un domaine-label si disponible).
+# 
+# ---
+# 
+# ## 13) Repro (configuration de référence)
+# 
+# ```python
+# CONFIG = {
+#   "window_size": 50,
+#   "window_overlap": 0.0,        # 0.5 recommandé si besoin
+#   "features": ["mean","std","min","max","rms"],
+#   "signals": ["acc_norm","gyro_norm","mag_norm"],
+#   "split": {"method":"GroupShuffleSplit", "test_size":0.3, "group":"source", "seed":42},
+#   "model": {"type":"RandomForest", "n_estimators":200, "random_state":0, "n_jobs":-1},
+#   "metrics": ["classification_report","confusion_matrix","roc_auc","pr_auc"]
+# }
+# 
 
-Entrée : descripteurs statistiques extraits sur des segments temporels glissants des signaux IMU.
-Sortie : y ∈ {0,1} avec 0 = normal, 1 = anomalie.
-2) Unité d’observation (fenêtrage temporel)
-Les fichiers sont échantillonnés à différentes fréquences (2/10/20 Hz). Pour homogénéiser l’analyse, on travaille sur des fenêtres de W échantillons (valeur par défaut W = 50).
-Conséquences temporelles approximatives :
+# %% [markdown]
+# # IV - Modèle baseline + évaluation
+# 
 
-20 Hz → 50 pts ≈ 2,5 s
-10 Hz → 50 pts ≈ 5 s
-2 Hz → 50 pts ≈ 25 s (fenêtre longue, à réduire si besoin pour ce cas)
-Remarque : on peut utiliser un recouvrement (ex. 50 %) pour augmenter la granularité sans augmenter les coûts de labellisation.
-
-Découpage en fenêtres (sans recouvrement pour la baseline) :
-Si un fichier a N lignes, le nombre de fenêtres est ⌊N / W⌋.
-
-3) Variables d’entrée (features)
-À partir des axes (X,Y,Z) on calcule d’abord les normes : [ \text{acc_norm}=\sqrt{accX^2+accY^2+accZ^2},\quad \text{gyro_norm}=\sqrt{gyroX^2+gyroY^2+gyroZ^2},\quad \text{mag_norm}=\sqrt{magX^2+magY^2+magZ^2}. ]
-
-Sur chaque fenêtre, pour chaque signal retenu (axes et/ou normes), on extrait des statistiques robustes :
-
-moyenne, écart-type, min, max, RMS (\left(\sqrt{\frac{1}{W}\sum s^2}\right)).
-Ces features sont peu coûteuses, stables entre capteurs hétérogènes et adaptées à TinyML.
-
-Optionnels (améliorations futures) : énergie de bandes fréquentielles (FFT), dérivées/jerk, corrélations inter-axes, entropie, zcr (zero-crossing rate), etc.
-
-4) Variable cible (labels)
-Pas de colonne label dans les fichiers → on utilise la convention de nommage :
-
-label = 1 si le nom du fichier contient : earthquake, hitting_arm, hitting_platform, extra_weigth, magnet.
-label = 0 sinon (fichiers IMU « normaux » : IMU_2Hz, IMU_10Hz, IMU_Acc_Gyro_20Hz, …).
-Label de fenêtre (majorité simple) :
-si ≥ 50 % des points de la fenêtre sont 1 → fenêtre 1, sinon 0.
-C’est un compromis simple qui stabilise le bruit instantané.
-
-5) Pré-traitements retenus
-Casting numérique robuste (errors='coerce'), suppression des lignes entièrement vides sur les colonnes IMU.
-Standardisation par source (fichier) pour absorber les offsets capteurs : [ z = \frac{x-\mu_{\text{source}}}{\sigma_{\text{source}}} ] Cette normalisation est apprise séparément pour chaque fichier afin d’éviter les fuites d’information.
-Agrégation fenêtre → features statistiques (cf. §3).
-6) Jeu d’évaluation & fuite d’information
-Les échantillons d’une même source (fichier) sont fortement corrélés. On doit donc évaluer par fichier, pas par lignes aléatoires.
-
-Split : GroupShuffleSplit avec group = source (le nom du fichier).
-Test ≈ 30 % des fichiers, Train ≈ 70 %.
-Variante robuste : Leave-One-Group-Out (LOGO) pour tester chaque fichier à tour de rôle (plus coûteux mais plus informatif).
-7) Métriques d’évaluation
-ROC-AUC (global) pour mesurer la capacité de classement.
-PR-AUC / F1 pour tenir compte du déséquilibre (anomalies rares).
-Matrice de confusion (TP/FP/FN/TN) pour fixer des seuils réalistes en exploitation ((P(\text{FP})) acceptable vs rappel ciblé).
-Cible industrielle (exemple) :
-
-Rappel (anomalies) ≥ 95 % ;
-Taux de fausses alertes ≤ 2 % (à ajuster selon le contexte).
-8) Gestion du déséquilibre des classes
-Fenêtrage et majority-label réduisent déjà l’extrême rareté point-par-point.
-Pendant l’entraînement : class_weight='balanced' ou sur-/sous-échantillonnage des fenêtres.
-Évaluation : toujours stratifier par fichier et rapporter PR-AUC.
-9) Modèle baseline (Step 4, annoncé ici)
-RandomForest (200 arbres) sur features statistiques → robuste, peu de réglages, interprétable via l’importance des variables.
-Alternatives TinyML :
-Logistic Regression (faible empreinte mémoire),
-Tiny tree/oblique tree (1–4 nœuds),
-Isolation Forest (non supervisé) si on veut éviter les labels de nommage.
-10) Contraintes temps réel & embarqué
-Latence ≈ taille de fenêtre / fréquence (ex. 50 pts @ 20 Hz → 2,5 s).
-Si la latence doit être < 1 s, deux leviers :
-diminuer W (ex. 20–30) pour les fichiers 10/20 Hz,
-utiliser fenêtres chevauchées (stride plus petit) pour densifier les décisions sans augmenter la latence perçue.
-Coût de calcul : features statistiques (O(W)), modèle léger (LR/mini-tree) pour MCU.
-11) Critères de réussite (baseline)
-Pipeline reproductible (mêmes splits, même normalisation par source).
-ROC-AUC ≥ 0,90 et PR-AUC convenable sur le test par fichier.
-Courbes ROC/PR + matrice de confusion + top features importances.
-Sauvegarde du modèle et des paramètres de normalisation (par source si nécessaire).
-12) Limites & risques
-Labels dérivés du nom de fichier → approximatifs si des segments « mixtes » existent ; la majority-rule l’atténue mais ne l’élimine pas.
-Fréquences hétérogènes → une fenêtre fixe correspond à des durées différentes ; à terme, utiliser une durée (en secondes) plutôt qu’un nombre d’échantillons.
-Covariate shift entre tâches (screwdriving vs painting) : valider par LOGO et, si besoin, ajouter des features spécifiques par tâche (ou un domaine-label si disponible).
-13) Repro (configuration de référence)
-CONFIG = {
-  "window_size": 50,
-  "window_overlap": 0.0,        # 0.5 recommandé si besoin
-  "features": ["mean","std","min","max","rms"],
-  "signals": ["acc_norm","gyro_norm","mag_norm"],
-  "split": {"method":"GroupShuffleSplit", "test_size":0.3, "group":"source", "seed":42},
-  "model": {"type":"RandomForest", "n_estimators":200, "random_state":0, "n_jobs":-1},
-  "metrics": ["classification_report","confusion_matrix","roc_auc","pr_auc"]
-}
-"""
-
-#IV - Modèle baseline + évaluation
+# %%
 # Sélection des features du modèle
 from sklearn.metrics import (
     classification_report,
@@ -293,9 +350,16 @@ from sklearn.metrics import (
     roc_auc_score,
     average_precision_score,
     RocCurveDisplay,
-    PrecisionRecallDisplay
+    PrecisionRecallDisplay,
+    recall_score, 
+    precision_score, 
+    f1_score
 )
-
+from sklearn.model_selection import GroupShuffleSplit
+from sklearn.ensemble import RandomForestClassifier
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np # 💡 AJOUT NÉCESSAIRE
 
 feat_cols_model = [c for c in dataset.columns
                    if c not in ('label','source')]
@@ -311,25 +375,104 @@ train_idx, test_idx = next(gss.split(X, y, groups))
 Xtr, Xte = X[train_idx], X[test_idx]
 ytr, yte = y[train_idx], y[test_idx]
 
-# Baseline simple, robuste et rapide
-clf = RandomForestClassifier(n_estimators=200, random_state=0, n_jobs=-1)
+# Baseline avec poids de classes équilibrés
+clf = RandomForestClassifier(
+    n_estimators=200,
+    random_state=0,
+    n_jobs=-1,
+    class_weight="balanced"
+)
 clf.fit(Xtr, ytr)
 
-pred = clf.predict(Xte)
+# Obtenir les probabilités de la classe 1
 proba = clf.predict_proba(Xte)[:,1]
 
-print("=== Rapport classification (test) ===")
-print(classification_report(yte, pred, digits=3))
 
-print("=== Matrice de confusion ===")
-print(confusion_matrix(yte, pred))
+# =========================================================
+# ÉTAPE 1 : Analyse des seuils (tableau de compromis)
+# =========================================================
+thresholds_to_test = [0.1, 0.3, 0.5, 0.7, 0.9]
+results = []
 
-# ROC-AUC / PR-AUC (protégé si une seule classe en test)
+print("=== Analyse de la performance selon le seuil de décision ===")
+
+for T in thresholds_to_test:
+    pred_T = (proba >= T).astype(int)
+
+    recall = recall_score(yte, pred_T, zero_division=0)
+    precision = precision_score(yte, pred_T, zero_division=0)
+    
+    # Calcul du Taux de Faux Positifs (FPR)
+    cm = confusion_matrix(yte, pred_T)
+    tn_plus_fp = cm[0, :].sum()
+    fp_rate = cm[0, 1] / tn_plus_fp if tn_plus_fp > 0 else 0
+
+    results.append({
+        'Threshold': T,
+        'Recall (Classe 1)': f'{recall:.3f}',
+        'Precision (Classe 1)': f'{precision:.3f}',
+        'F1-Score': f'{f1_score(yte, pred_T, zero_division=0):.3f}',
+        'False Positive Rate (FPR)': f'{fp_rate:.4f}'
+    })
+
+results_df = pd.DataFrame(results)
+print(results_df.to_markdown(index=False))
+
+
+# =========================================================
+# ÉTAPE 2 : Sélection du SEUIL OPTIMAL pour l'équilibre Rappel/FPR
+# =========================================================
+MAX_FPR = 0.05 # Contrainte industrielle : Taux de FP max 5%
+
+best_metric = -1
+selected_T = -1
+
+# Recherche sur une grille plus fine
+thresholds_fine_grid = [i/100 for i in range(5, 95, 5)] 
+
+for T in thresholds_fine_grid:
+    pred_T = (proba >= T).astype(int)
+    
+    # Nécessaire pour éviter les erreurs de calcul si une seule classe est prédite
+    if len(np.unique(pred_T)) < 2: 
+        continue
+        
+    current_recall = recall_score(yte, pred_T, zero_division=0)
+    cm = confusion_matrix(yte, pred_T)
+    tn_plus_fp = cm[0, :].sum()
+    current_fp_rate = cm[0, 1] / tn_plus_fp if tn_plus_fp > 0 else 1.0
+
+    # On maximise le Rappel tout en respectant la contrainte MAX_FPR
+    if current_fp_rate <= MAX_FPR and current_recall > best_metric:
+        best_metric = current_recall
+        selected_T = T
+
+if selected_T != -1:
+    OPTIMAL_THRESHOLD = selected_T
+    print(f"\nSeuil sélectionné pour maximiser le Rappel (contrainte FPR < {MAX_FPR:.2f}) : {OPTIMAL_THRESHOLD:.2f}")
+else:
+    # Si la contrainte FPR est trop stricte, on utilise le seuil 0.5 comme fallback
+    OPTIMAL_THRESHOLD = 0.5
+    print(f"\nAttention: Aucun seuil ne respecte FPR < {MAX_FPR:.2f}. Utilisation du seuil par défaut {OPTIMAL_THRESHOLD}.")
+
+# =========================================================
+# ÉTAPE 3 : Évaluation finale avec le seuil optimal
+# =========================================================
+pred_optimal = (proba >= OPTIMAL_THRESHOLD).astype(int)
+
+print(f"\n=== Rapport classification (test, Seuil {OPTIMAL_THRESHOLD:.2f}) ===")
+print(classification_report(yte, pred_optimal, digits=3))
+
+print(f"=== Matrice de confusion (Seuil {OPTIMAL_THRESHOLD:.2f}) ===")
+print(confusion_matrix(yte, pred_optimal))
+
+
+# ROC-AUC / PR-AUC
 try:
     roc = roc_auc_score(yte, proba)
-    pr  = average_precision_score(yte, proba)
-    print(f"ROC-AUC : {roc:.3f}")
-    print(f"PR-AUC  : {pr:.3f}")
+    pr 	= average_precision_score(yte, proba)
+    print(f"\nROC-AUC : {roc:.3f}")
+    print(f"PR-AUC 	: {pr:.3f}")
 
     RocCurveDisplay.from_predictions(yte, proba)
     plt.title("ROC — RandomForest baseline")
@@ -341,8 +484,7 @@ try:
 except ValueError as e:
     print("Courbes ROC/PR non calculables :", e)
 
-# (Option) Top features pour interpréter la baseline
-import pandas as pd
+# Top features
 imp = pd.Series(clf.feature_importances_, index=feat_cols_model).sort_values(ascending=False).head(15)
 plt.figure()
 imp.plot(kind="barh")
@@ -351,8 +493,10 @@ plt.title("Top feature importances — RandomForest")
 plt.xlabel("importance")
 plt.show()
 
+# %% [markdown]
+# # V - Grid Search + Ensembles (LAB 6 appliqué au projet)
 
-#V - Grid Search + Ensembles (LAB 6 appliqué au projet)
+# %%
 from sklearn.model_selection import GroupShuffleSplit, GridSearchCV
 from sklearn.ensemble import RandomForestClassifier, BaggingClassifier, VotingClassifier
 from sklearn.svm import SVC
@@ -366,10 +510,12 @@ import time
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-Train size : (126706, 60)  Test size : (106559, 60)
-Fitting 3 folds for each of 162 candidates, totalling 486 fits
 
-"#1) Reprise des features / labels / groupes
+
+# %% [markdown]
+# ## 1) Reprise des features / labels / groupes 
+
+# %%
 feat_cols_model = [c for c in dataset.columns
                    if c not in ("label", "source")]
 
@@ -387,7 +533,10 @@ groups_tr = groups[train_idx]
 
 print("Train size :", Xtr.shape, " Test size :", Xte.shape)
 
-#2) GridSearch sur RandomForest (baseline optimisée)
+# %% [markdown]
+# ## 2) GridSearch sur RandomForest (baseline optimisée)
+
+# %%
 rf_base = RandomForestClassifier(
     random_state=0,
     n_jobs=-1,
@@ -421,7 +570,13 @@ print(rf_grid.best_params_)
 print(f"Best CV F1-score: {rf_grid.best_score_:.3f}")
 
 best_rf = rf_grid.best_estimator_
-#3) Helper d'évaluation pour tous les modèles
+
+# %% [markdown]
+# ## 3) Helper d'évaluation pour tous les modèles
+
+# %%
+
+
 def eval_model(name, model, Xtr, ytr, Xte, yte):
     """Fit + prédiction + métriques + temps, pour un modèle donné."""
     t0 = time.time()
@@ -471,9 +626,82 @@ results = []
 # Évaluation de la baseline optimisée RandomForest
 results.append(eval_model("RandomForest (tuned)", best_rf, Xtr, ytr, Xte, yte))
 
-#4) Ensemble 1 : Bagging SVM
-# --- 4.1 Ensemble 1 : Bagging SVM ( ---
 
+# %% [markdown]
+# ## 4) Bagging SVM
+
+# %%
+# =========================================================
+# 💡 NÉCESSAIRE : Nouvelle définition de eval_model avec seuil
+# (Assurez-vous d'exécuter ce bloc AVANT d'exécuter les ensembles)
+# =========================================================
+def eval_model(name, model, Xtr, ytr, Xte, yte, threshold=0.5):
+    """Fit + prédiction + métriques + temps, pour un modèle donné, avec ajustement du seuil."""
+    t0 = time.time()
+    model.fit(Xtr, ytr)
+    fit_time = time.time() - t0
+
+    t1 = time.time()
+    
+    y_proba = None
+    try:
+        # Tente d'utiliser predict_proba pour l'ajustement du seuil
+        y_proba = model.predict_proba(Xte)[:, 1]
+        
+        # 🎯 Application du seuil personnalisé
+        y_pred = (y_proba >= threshold).astype(int)
+        
+        infer_time = time.time() - t1
+        
+    except AttributeError:
+        # Si predict_proba n'est pas disponible (ex: certains modèles SVM sans probability=True)
+        y_pred = model.predict(Xte)
+        infer_time = time.time() - t1
+    
+    # Métriques
+    acc  = accuracy_score(yte, y_pred)
+    f1   = f1_score(yte, y_pred, zero_division=0)
+    prec = precision_score(yte, y_pred, zero_division=0)
+    rec  = recall_score(yte, y_pred, zero_division=0)
+
+    print(f"\n================ {name} (Threshold={threshold:.2f}) ================")
+    print(classification_report(yte, y_pred, digits=3))
+    print("Confusion matrix:\n", confusion_matrix(yte, y_pred))
+
+    roc = pr = None
+    if y_proba is not None and len(np.unique(yte)) == 2:
+        try:
+            roc = roc_auc_score(yte, y_proba)
+            pr  = average_precision_score(yte, y_proba)
+            print(f"ROC-AUC: {roc:.3f}")
+            print(f"PR-AUC : {pr:.3f}")
+        except ValueError:
+             print("ROC/PR non calculables.")
+
+
+    return {
+        "model": name,
+        "threshold": threshold, # Ajout du seuil aux résultats
+        "accuracy": acc,
+        "f1": f1,
+        "precision": prec,
+        "recall": rec,
+        "roc_auc": roc,
+        "pr_auc": pr,
+        "fit_time_s": fit_time,
+        "infer_time_s": infer_time
+    }
+# Fin de la nouvelle définition de eval_model
+
+# =========================================================
+# APPLICATION DU SEUIL ÉLEVÉ (0.95 par exemple)
+# =========================================================
+# Utilisez le seuil que vous avez trouvé optimal pour minimiser les FP avec RF (par ex. 0.95)
+OPTIMAL_THRESHOLD_ENSEMBLES = 0.95 
+
+# --- Ensemble 1 : Bagging SVM ( ---
+
+# Assurez-vous que svm_base a bien probability=True (c'est le cas dans votre code)
 svm_base = SVC(
     probability=True,
     random_state=42,
@@ -485,18 +713,19 @@ svm_base = SVC(
 
 bag_svm = BaggingClassifier(
     estimator=svm_base,
-    n_estimators=5,      # ne pas mettre trop haut pour ne pas tuer le PC
+    n_estimators=5,       # ne pas mettre trop haut pour ne pas tuer le PC
     max_samples=0.7,
     n_jobs=-1,
     random_state=42
 )
 
 results.append(
-    eval_model("Bagging SVM (no tuning)", bag_svm, Xtr, ytr, Xte, yte)
+    # 🎯 APPLICATION DU SEUIL ICI
+    eval_model("Bagging SVM (Précision focus)", bag_svm, Xtr, ytr, Xte, yte, threshold=OPTIMAL_THRESHOLD_ENSEMBLES)
 )
 
 
-# --- 4.2 Ensemble 2 : Bagging Decision Tree ---
+# --- Ensemble 2 : Bagging Decision Tree ---
 
 tree_base = DecisionTreeClassifier(
     random_state=42,
@@ -508,22 +737,24 @@ tree_base = DecisionTreeClassifier(
 
 bag_tree = BaggingClassifier(
     estimator=tree_base,
-    n_estimators=15,     # ne pas mettre trop haut pour ne pas tuer le PC
+    n_estimators=15,      # ne pas mettre trop haut pour ne pas tuer le PC
     max_samples=0.7,
     n_jobs=-1,
     random_state=42
 )
 
 results.append(
-    eval_model("Bagging Tree (no tuning)", bag_tree, Xtr, ytr, Xte, yte)
+    # 🎯 APPLICATION DU SEUIL ICI
+    eval_model("Bagging Tree (Précision focus)", bag_tree, Xtr, ytr, Xte, yte, threshold=OPTIMAL_THRESHOLD_ENSEMBLES)
 )
 
 
-# --- 4.3 Ensemble 3 : Voting (RF + Bagging SVM + Bagging Tree) ---
+# --- Ensemble 3 : Voting (RF + Bagging SVM + Bagging Tree) ---
 
+# Note : best_rf doit avoir été défini par le GridSearchCV précédent
 voting_clf = VotingClassifier(
     estimators=[
-        ("rf", best_rf),          
+        ("rf", best_rf),           
         ("bag_svm", bag_svm),
         ("bag_tree", bag_tree)
     ],
@@ -532,11 +763,12 @@ voting_clf = VotingClassifier(
 )
 
 results.append(
-    eval_model("Voting (RF + BagSVM + BagTree)", voting_clf, Xtr, ytr, Xte, yte)
+    # APPLICATION DU SEUIL ICI
+    eval_model("Voting (Précision focus)", voting_clf, Xtr, ytr, Xte, yte, threshold=OPTIMAL_THRESHOLD_ENSEMBLES)
 )
 
 
-# --- 4.4 Tableau récap + barplot ---
+# --- Tableau récap + barplot ---
 
 results_df = pd.DataFrame(results)
 display(results_df.sort_values("f1", ascending=False))

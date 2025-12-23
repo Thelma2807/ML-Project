@@ -1,0 +1,5 @@
+numpy
+pandas
+matplotlib
+scikit-learn
+jupyterhttps://github.com/Thelma2807/ML-Project/tree/main
